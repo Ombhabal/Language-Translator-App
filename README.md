@@ -61,6 +61,7 @@ translator-app/
 ---
 ## 📸 Screenshot
 Here’s how it looks:
+
 ![App Screenshot](screenshot.png)
 ---
 ## 🙌 Credits
