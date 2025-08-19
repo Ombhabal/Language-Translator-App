@@ -69,3 +69,7 @@ Here’s how it looks:
 - 🎶 Audio Playback: [pygame](https://www.pygame.org/)
 - 🎤 Speech Recognition: [SpeechRecognition](https://pypi.org/project/SpeechRecognition/)
 ---
+## 📄 License
+```bash
+```
+---
