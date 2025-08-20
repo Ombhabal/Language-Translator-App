@@ -10,6 +10,7 @@ import time
 import speech_recognition as sr
 import atexit
 from gtts.lang import tts_langs
+import re
 
 
 class TranslatorApp:
@@ -31,6 +32,21 @@ class TranslatorApp:
         self.setup_translator()
         self.setup_ui()
         self.center_window()
+
+        # Variables for language detection
+        self.last_detection_time = 0
+        self.detection_delay = 1.5  # seconds between detections
+        self.auto_detect_enabled = True  # Auto-detect is always enabled now
+
+        # Cooldown for manual changes
+        self.last_manual_change_time = 0
+        self.manual_change_cooldown = 3.0  # seconds
+
+        # Bind text change event for auto-detection
+        self.source_text.bind("<KeyRelease>", self.on_text_change)
+
+        # Track source language changes
+        self.src_lang.trace_add("write", self.on_src_lang_changed)
 
         # Cleanup on exit
         atexit.register(self.cleanup)
@@ -56,9 +72,24 @@ class TranslatorApp:
 
     def setup_translator(self):
         try:
-            self.translator = GoogleTranslator(source="english", target="hindi")
+            self.translator = GoogleTranslator(source="auto", target="hindi")
             self.languages_dict = self.translator.get_supported_languages(as_dict=True)
-            self.languages = sorted(list(self.languages_dict.keys()))
+
+            # Create properly capitalized language names for display
+            self.languages = ["Auto"]  # Add "Auto" as the first option
+            for lang_name in self.languages_dict.keys():
+                # Handle special cases for proper capitalization
+                if "(" in lang_name:
+                    # For languages like "chinese (simplified)"
+                    parts = lang_name.split(" (")
+                    capitalized = parts[0].capitalize() + " (" + parts[1].capitalize()
+                    self.languages.append(capitalized)
+                else:
+                    # For regular language names
+                    self.languages.append(lang_name.capitalize())
+
+            self.languages = sorted(self.languages[1:])  # Sort all except "Auto"
+            self.languages.insert(0, "Auto")  # Put "Auto" back at the beginning
 
             # Get supported TTS languages
             self.tts_languages = tts_langs()
@@ -68,14 +99,100 @@ class TranslatorApp:
                 text=f"⚠️ Failed to initialize translator: {str(e)}",
                 foreground="#FF9800",
             )
-            self.languages_dict = {"english": "en", "hindi": "hi"}  # Fallback
-            self.languages = list(self.languages_dict.keys())
+            # Fallback with properly capitalized names
+            self.languages_dict = {"english": "en", "hindi": "hi"}
+            self.languages = ["Auto", "English", "Hindi"]
             self.tts_languages = {"en": "English", "hi": "Hindi"}
 
         self.recognizer = sr.Recognizer()
         self.microphone = sr.Microphone()
         self.listening = False
         self.current_audio_file = None
+
+    def get_language_code(self, language_name):
+        """Get the language code from a properly capitalized language name"""
+        # Handle "Auto" selection
+        if language_name.lower() == "auto":
+            return "auto"
+
+        # Convert back to lowercase to match the dictionary keys
+        lang_lower = language_name.lower()
+        for lang_name_key, lang_code in self.languages_dict.items():
+            if lang_name_key.lower() == lang_lower:
+                return lang_code
+        return None
+
+    # ----------------------- LANGUAGE DETECTION -----------------------
+    def detect_language(self, text):
+        """Detect the language of the given text"""
+        if not text.strip() or len(text.strip()) < 3:  # Need at least 3 characters
+            return "Auto"  # Default to Auto
+
+        # Check if text contains mostly non-alphabetic characters
+        alpha_chars = sum(1 for c in text if c.isalpha())
+        if alpha_chars / len(text) < 0.5:  # Less than 50% alphabetic characters
+            return "Auto"  # Default to Auto for encoded/garbled text
+
+        try:
+            # Use GoogleTranslator to detect language
+            detected = GoogleTranslator(source="auto", target="en").detect(text)
+
+            # Convert language code to properly capitalized full name
+            for lang_name, lang_code in self.languages_dict.items():
+                if lang_code == detected:
+                    # Find the properly capitalized version in our languages list
+                    for available_lang in self.languages:
+                        if available_lang.lower() == lang_name.lower():
+                            return available_lang
+
+            return "Auto"  # Default if not found
+
+        except Exception as e:
+            print(f"Language detection error: {e}")
+            return "Auto"  # Default on error
+
+    def on_text_change(self, event):
+        """Handle text changes in the source text box for language detection"""
+        # Don't auto-detect if a manual change happened recently
+        current_time = time.time()
+        if current_time - self.last_manual_change_time < self.manual_change_cooldown:
+            return
+
+        current_time = time.time()
+        if current_time - self.last_detection_time < self.detection_delay:
+            return
+
+        text = self.source_text.get(1.0, tk.END).strip()
+        if not text or len(text) < 3:
+            return
+
+        self.last_detection_time = current_time
+
+        # Use threading to avoid UI freeze
+        def detect_in_thread():
+            detected_lang = self.detect_language(text)
+            if detected_lang != self.src_lang.get():
+                # Update the UI in the main thread
+                self.root.after(0, lambda: self.update_source_language(detected_lang))
+
+        threading.Thread(target=detect_in_thread, daemon=True).start()
+
+    def update_source_language(self, language):
+        """Update the source language dropdown"""
+        # Make sure we use the exact case as in the languages list
+        for lang in self.languages:
+            if lang.lower() == language.lower():
+                self.src_lang.set(lang)
+                break
+
+    def on_src_lang_changed(self, *args):
+        """Handle changes to the source language"""
+        lang = self.src_lang.get()
+        self.from_label.config(text=f"From: {lang}")
+        self.status_label.config(
+            text=f"🌍 Language set to: {lang}", foreground="#4285F4"
+        )
+        self.root.after(3000, lambda: self.status_label.config(text=""))
 
     # ----------------------- UTILITIES -----------------------
     def center_window(self):
@@ -98,31 +215,36 @@ class TranslatorApp:
         threading.Thread(target=_animate, daemon=True).start()
 
     # ----------------------- TRANSLATION -----------------------
-    def translate_text(self, text: str, src="english", dest="hindi"):
+    def translate_text(self, text: str, src="auto", dest="Hindi"):
         if not text.strip():
             return ""
 
-        # Normalize language names
-        src = src.lower()
-        dest = dest.lower()
-
         try:
-            # Check if languages are supported
-            if src not in self.languages_dict:
-                self.status_label.config(
-                    text=f"⚠️ Source language '{src}' not supported",
-                    foreground="#FF9800",
-                )
-                return ""
+            # For auto-detection, use "auto" as source
+            if src == "Auto" or src == "auto":
+                source_code = "auto"
+            else:
+                # Get language code from properly capitalized name
+                source_code = self.get_language_code(src)
+                if not source_code:
+                    self.status_label.config(
+                        text=f"⚠️ Source language '{src}' not supported",
+                        foreground="#FF9800",
+                    )
+                    return ""
 
-            if dest not in self.languages_dict:
+            # Get target language code from properly capitalized name
+            target_code = self.get_language_code(dest)
+            if not target_code:
                 self.status_label.config(
                     text=f"⚠️ Target language '{dest}' not supported",
                     foreground="#FF9800",
                 )
                 return ""
 
-            return GoogleTranslator(source=src, target=dest).translate(text)
+            return GoogleTranslator(source=source_code, target=target_code).translate(
+                text
+            )
 
         except Exception as e:
             self.status_label.config(
@@ -142,7 +264,13 @@ class TranslatorApp:
             self.animate_status("Translating", "#FF9800")
 
             try:
-                translated = self.translate_text(text, src_lang, dest_lang)
+                # Use auto-detection if enabled or if source is set to Auto
+                source = (
+                    "auto"
+                    if (self.auto_detect_enabled or src_lang == "Auto")
+                    else src_lang
+                )
+                translated = self.translate_text(text, source, dest_lang)
                 if translated:
                     self.dest_text.delete(1.0, tk.END)
                     self.dest_text.insert(tk.END, translated)
@@ -160,6 +288,14 @@ class TranslatorApp:
         if not text.strip():
             return
 
+        # Don't try to speak if language is set to Auto
+        if language == "Auto":
+            self.status_label.config(
+                text="⚠️ Cannot speak text when language is set to Auto",
+                foreground="#FF9800",
+            )
+            return
+
         def _speak():
             try:
                 # Stop any currently playing audio
@@ -174,9 +310,10 @@ class TranslatorApp:
                     except:
                         pass
 
-                # Get language code with fallback to English
-                lang_name = language.lower()
-                lang_code = self.languages_dict.get(lang_name, "en")
+                # Get language code from properly capitalized name
+                lang_code = self.get_language_code(language)
+                if not lang_code:
+                    lang_code = "en"  # Fallback to English
 
                 # Check if TTS is supported for this language
                 if lang_code not in self.tts_languages:
@@ -257,8 +394,14 @@ class TranslatorApp:
                     self.root.update()
 
                     try:
-                        lang_name = self.src_lang.get().lower()
-                        lang_code = self.languages_dict.get(lang_name, "en")
+                        lang_name = self.src_lang.get()
+                        # If source language is set to Auto, use English for speech recognition
+                        if lang_name == "Auto":
+                            lang_code = "en"
+                        else:
+                            lang_code = self.get_language_code(lang_name)
+                            if not lang_code:
+                                lang_code = "en"  # Fallback to English
 
                         # Check if speech recognition is supported for this language
                         if lang_code not in [
@@ -320,8 +463,18 @@ class TranslatorApp:
     # ----------------------- UI -----------------------
     def swap_languages(self):
         src, dest = self.src_lang.get(), self.dest_lang.get()
+        # Don't swap if either language is Auto
+        if src == "Auto" or dest == "Auto":
+            self.status_label.config(
+                text="⚠️ Cannot swap with Auto detection", foreground="#FF9800"
+            )
+            return
+
         self.src_lang.set(dest)
         self.dest_lang.set(src)
+
+        # Record the time of manual change to prevent auto-detection override
+        self.last_manual_change_time = time.time()
 
     def setup_ui(self):
         main_frame = tk.Frame(self.root, bg="#f5f5f5")
@@ -414,15 +567,18 @@ class TranslatorApp:
             command=lambda: self.speak_text(
                 self.source_text.get(1.0, tk.END).strip(), self.src_lang.get()
             ),
-        ).pack(side=tk.LEFT)
+        ).pack(side=tk.LEFT, padx=5)
 
         lang_controls = tk.Frame(source_frame, bg="#ffffff")
         lang_controls.pack(fill=tk.X, pady=(0, 0))
 
-        tk.Label(lang_controls, text="From:", font=("Arial", 9), bg="#ffffff").pack(
-            side=tk.LEFT, padx=(0, 5)
+        # Store the "From:" label as an instance variable so we can update it later
+        self.from_label = tk.Label(
+            lang_controls, text="From:", font=("Arial", 9), bg="#ffffff"
         )
-        self.src_lang = tk.StringVar(value="english")
+        self.from_label.pack(side=tk.LEFT, padx=(0, 5))
+
+        self.src_lang = tk.StringVar(value="Auto")
         self.src_combobox = ttk.Combobox(
             lang_controls,
             textvariable=self.src_lang,
@@ -440,17 +596,17 @@ class TranslatorApp:
             bg="#4CC210",
             fg="white",
             bd=0,
-            command=self.swap_languages,  # keep your function
+            command=self.swap_languages,
         ).pack(side=tk.LEFT, padx=2)
 
         tk.Label(lang_controls, text="To:", font=("Arial", 9), bg="#ffffff").pack(
             side=tk.LEFT, padx=(2, 5)
         )
-        self.dest_lang = tk.StringVar(value="hindi")
+        self.dest_lang = tk.StringVar(value="Hindi")
         self.dest_combobox = ttk.Combobox(
             lang_controls,
             textvariable=self.dest_lang,
-            values=self.languages,
+            values=self.languages[1:],  # Exclude "Auto" from destination options
             font=("Arial", 9),
             width=16,
             state="readonly",
@@ -526,7 +682,7 @@ class TranslatorApp:
         # Status Bar
         self.status_label = tk.Label(
             main_frame,
-            text="",
+            text="Ready - Type in any language to auto-detect",
             font=("Arial", 9),
             bg="#f5f5f5",
             fg="#4285F4",
